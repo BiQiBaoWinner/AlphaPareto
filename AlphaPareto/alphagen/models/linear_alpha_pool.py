@@ -1,0 +1,528 @@
+import copy
+import math
+from itertools import count
+from typing import List, Optional, Tuple, Iterable, Dict, Any, Set
+from abc import ABCMeta, abstractmethod
+
+import numpy as np
+import torch
+
+from .alpha_pool import AlphaPoolBase
+from ..data.calculator import AlphaCalculator, TensorAlphaCalculator
+from ..data.expression import Expression, OutOfDataRangeError
+from ..data.pool_update import PoolUpdate, AddRemoveAlphas
+from ..utils.correlation import batch_pearsonr
+from ..rl.compute_metrics import compute_batch_metrics, compute_testset_metrics
+from ..rl.lambda_solver import solve_lambda
+
+class LinearAlphaPool(AlphaPoolBase, metaclass=ABCMeta):
+    def __init__(
+        self,
+        capacity: int,
+        calculator: AlphaCalculator,
+        ic_lower_bound: Optional[float] = None,
+        device: torch.device = torch.device("cpu"),
+        c_override: Optional[List[float]] = None
+    ):
+        super().__init__(capacity, calculator, device)
+        self.exprs: List[Optional[Expression]] = [None for _ in range(capacity + 1)]
+        self.single_ics: np.ndarray = np.zeros(capacity + 1)
+        self._weights: np.ndarray = np.zeros(capacity + 1)
+        self._mutual_ics: np.ndarray = np.identity(capacity + 1)
+        self._extra_info = [None for _ in range(capacity + 1)]
+        self._ic_lower_bound = -1. if ic_lower_bound is None else ic_lower_bound
+        self.current_train_ic = -1.
+        self.current_train_obj = -1.
+        self.best_obj = -1.
+        self.ic_at_best_obj = -1.
+        self.update_history: List[PoolUpdate] = []
+        self._failure_cache: Set[str] = set()
+        
+        self._pool_reward_vec: Optional[np.ndarray] = None
+        self._pool_lambda: Optional[np.ndarray] = None
+        
+        self.c_override = list(c_override) if c_override is not None else [0.08, 0.95, 0.9, 0.6]
+
+    def _clone_kwargs(self) -> Dict[str, Any]:
+        "Return keyword arguments required to create the same pool type."
+        return {
+            "capacity": self.capacity,
+            "calculator": self.calculator,
+            "ic_lower_bound": self._ic_lower_bound,
+            "device": self.device,
+            "c_override": list(self.c_override)
+        }
+
+    def clone(self) -> "LinearAlphaPool":
+        "Create a detached copy of the pool for checkpointing."
+        cloned_pool = self.__class__(**self._clone_kwargs())
+        cloned_pool.size = self.size
+        cloned_pool.eval_cnt = self.eval_cnt
+        # cloned_pool.best_ic_ret = self.best_ic_ret
+        cloned_pool.current_train_ic = self.current_train_ic
+        cloned_pool.current_train_obj = self.current_train_obj
+        cloned_pool._pool_lambda = self._pool_lambda if self._pool_lambda is not None else None
+        cloned_pool._pool_reward_vec = self._pool_reward_vec if self._pool_reward_vec is not None else None
+        cloned_pool.ic_at_best_obj = self.ic_at_best_obj
+        cloned_pool.best_obj = self.best_obj
+
+        if self.size > 0:
+            cloned_pool.exprs[:self.size] = self.exprs[:self.size]
+            cloned_pool.single_ics[:self.size] = self.single_ics[:self.size].copy()
+            cloned_pool._weights[:self.size] = self._weights[:self.size].copy()
+            cloned_pool._mutual_ics[:self.size, :self.size] = (
+                self._mutual_ics[:self.size, :self.size].copy()
+            )
+            cloned_pool._extra_info[:self.size] = [
+                copy.deepcopy(item) for item in self._extra_info[:self.size]
+            ]
+
+        cloned_pool.update_history = copy.deepcopy(self.update_history)
+        cloned_pool._failure_cache = set(self._failure_cache)
+        return cloned_pool
+
+    @property
+    def weights(self) -> np.ndarray:
+        "Get the weights of the linear model as a numpy array of shape (size,)."
+        return self._weights[:self.size]
+
+    @weights.setter
+    def weights(self, value: np.ndarray) -> None:
+        "Set the weights of the linear model with a numpy array of shape (size,)."
+        assert value.shape == (self.size,), f"Invalid weights shape: {value.shape}"
+        self._weights[:self.size] = value
+
+    @property
+    def state(self) -> Dict[str, Any]:
+        return {
+            "exprs": self.exprs[:self.size],
+            "ics_ret": list(self.single_ics[:self.size]),
+            "weights": list(self.weights),
+            "train_ic": self.current_train_ic,
+            "lambda": None if self._pool_lambda is None else self._pool_lambda.tolist(),
+            "reward_vec": None if self._pool_reward_vec is None else self._pool_reward_vec.tolist(),
+        }
+
+    def to_json_dict(self) -> Dict[str, Any]:
+        return {
+            "exprs": [str(expr) for expr in self.exprs[:self.size]],
+            "weights": list(self.weights),
+            "ics_ret": list(self.single_ics[:self.size]),
+            "lambda": None if self._pool_lambda is None else self._pool_lambda.tolist(),
+            "reward_vec": None if self._pool_reward_vec is None else self._pool_reward_vec.tolist(),
+            "train_ic": self.current_train_ic,
+            "train_obj": self.current_train_obj,
+        }
+
+    def try_new_expr(self, expr: Expression) -> float:
+        ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=0.99)
+        if ic_ret is None or ic_mut is None or np.isnan(ic_ret) or np.isnan(ic_mut).any():
+            return 0.
+        if str(expr) in self._failure_cache:
+            return self.best_obj
+
+        self.eval_cnt += 1
+        old_pool: List[Expression] = self.exprs[:self.size]     # type: ignore
+        self._add_factor(expr, ic_ret, ic_mut)
+        if self.size > 1:
+            new_weights = self.optimize()
+            worst_idx = None
+            if self.size > self.capacity:   # Need to remove one
+                worst_idx = int(np.argmin(np.abs(new_weights)))
+                # The one added this time is the worst, revert the changes
+                if worst_idx == self.capacity:
+                    self._pop(worst_idx)
+                    self._failure_cache.add(str(expr))
+                    return self.best_obj
+            removed_idx = [worst_idx] if worst_idx is not None else []
+            self.weights = new_weights
+            self.update_history.append(AddRemoveAlphas(
+                added_exprs=[expr],
+                removed_idx=removed_idx,
+                old_pool=old_pool,
+                old_pool_ic=self.evaluate_ensemble(),
+                new_pool_ic=ic_ret
+            ))
+            if worst_idx is not None:
+                self._pop(worst_idx)
+        else:
+            self.update_history.append(AddRemoveAlphas(
+                added_exprs=[expr],
+                removed_idx=[],
+                old_pool=[],
+                old_pool_ic=0.,
+                new_pool_ic=ic_ret
+            ))
+
+        self._failure_cache = set()
+        new_ic_ret, new_obj = self.calculate_ic_and_objective()
+        self.current_train_ic = new_ic_ret
+        self.current_train_obj = new_obj
+        self._maybe_update_best(new_ic_ret, new_obj)
+        
+        return new_obj
+
+    def force_load_exprs(self, exprs: List[Expression], weights: Optional[List[float]] = None) -> None:
+        self._failure_cache = set()
+        old_ic = self.evaluate_ensemble()
+        old_pool: List[Expression] = self.exprs[:self.size] # type: ignore
+        added = []
+        for expr in exprs:
+            if self.size >= self.capacity:
+                break
+            try:
+                ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=None)
+            except (OutOfDataRangeError, TypeError):
+                continue
+            assert ic_ret is not None and ic_mut is not None
+            self._add_factor(expr, ic_ret, ic_mut)
+            added.append(expr)
+            assert self.size <= self.capacity
+        if weights is not None:
+            if len(weights) != self.size:
+                raise ValueError(f"Invalid weights length: got {len(weights)}, expected {self.size}")
+            self.weights = np.array(weights)
+        else:
+            self.weights = self.optimize()
+        new_ic, new_obj = self.calculate_ic_and_objective()
+        self.current_train_ic = new_ic
+        self.current_train_obj = new_obj
+        self._maybe_update_best(new_ic, new_obj)
+        self.update_history.append(AddRemoveAlphas(
+            added_exprs=added,
+            removed_idx=[],
+            old_pool=old_pool,
+            old_pool_ic=old_ic,
+            new_pool_ic=new_ic
+        ))
+
+    def calculate_ic_and_objective(self) -> Tuple[float, float]:
+        ic = self.evaluate_ensemble()
+        obj = self._calc_main_objective()
+        if obj is None:
+            obj = ic
+        return ic, obj
+
+    def _calc_main_objective(self) -> Optional[float]:
+        "Get the main optimization objective, return None for the default (ensemble IC)."
+        
+        formulas = [str(e) for e in self.exprs[:self.size]]  # type: ignore
+        weights = self.weights.tolist()
+        result = compute_batch_metrics(formulas, weights, self.calculator, window_size=252, step_size=5)
+        batch_reward_vec = result.vector  # shape (B,4)
+        
+        lam_star, _, _ = solve_lambda(
+            batch_reward_vec,
+            lr=0.01,
+            steps=500,
+            retries=1,
+            device=self.device,
+            c_override=self.c_override
+        )
+        if batch_reward_vec.ndim == 2:
+            reward_vec = batch_reward_vec.mean(axis=0)
+            reward_vec = torch.tensor(reward_vec, device=self.device, dtype=torch.float32)
+        lam_star = torch.tensor(lam_star, device=self.device, dtype=torch.float32)
+        print("Solved lambda:", lam_star.detach().cpu().numpy(), "for reward vector:", reward_vec.detach().cpu().numpy())
+        
+        self._pool_lambda = lam_star
+        self._pool_reward_vec = reward_vec
+        
+        return float(torch.matmul(reward_vec, lam_star).item())
+        
+    def _maybe_update_best(self, ic: float, obj: float) -> bool:
+        if obj <= self.best_obj:
+            return False
+        self.best_obj = obj
+        # self.best_ic_ret = ic
+        self.ic_at_best_obj = ic
+        return True
+
+    @abstractmethod
+    def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:
+        "Optimize the weights of the linear model and return the new weights as a numpy array."
+
+    def test_ensemble(self, calculator: AlphaCalculator) -> Tuple[float, float]:
+        return calculator.calc_pool_all_ret(self.exprs[:self.size], self.weights)      # type: ignore
+
+    def test_ensemble_obj(self, calculator: AlphaCalculator) -> float:
+        if self.size == 0:
+            return 0.0
+        ic = calculator.calc_pool_IC_ret(self.exprs[:self.size], self.weights)
+        try:
+            if isinstance(calculator, TensorAlphaCalculator):
+                formulas = [str(e) for e in self.exprs[:self.size]]
+                weights = self.weights.tolist()
+                result = compute_testset_metrics(formulas, weights, calculator)
+                reward_vec = result.vector  # shape (4, )
+                
+                lam = self._pool_lambda
+                if lam is not None:
+                    if not isinstance(reward_vec, torch.Tensor):
+                        reward_vec = torch.tensor(reward_vec, device=self.device, dtype=torch.float32)
+                    lam = torch.tensor(lam, device=self.device, dtype=torch.float32)
+                    return float(torch.matmul(reward_vec, lam).item())
+                else:
+                    raise ValueError("No lambda found for test objective calculation.")
+        except Exception:
+            print("Error in calculating test objective, fallback to IC:", str(e))
+            pass
+        return ic
+
+    def evaluate_ensemble(self) -> float:
+        if self.size == 0:
+            return 0.
+        return self.calculator.calc_pool_IC_ret(self.exprs[:self.size], self.weights)  # type: ignore
+
+    @property
+    def _under_thres_alpha(self) -> bool:
+        if self._ic_lower_bound is None or self.size > 1:
+            return False
+        return self.size == 0 or abs(self.single_ics[0]) < self._ic_lower_bound
+
+    def _calc_ics(
+        self,
+        expr: Expression,
+        ic_mut_threshold: Optional[float] = None
+    ) -> Tuple[float, Optional[List[float]]]:
+        single_ic = self.calculator.calc_single_IC_ret(expr)
+        if not self._under_thres_alpha and single_ic < self._ic_lower_bound:
+            return single_ic, None
+
+        mutual_ics = []
+        for i in range(self.size):
+            mutual_ic = self.calculator.calc_mutual_IC(expr, self.exprs[i])     # type: ignore
+            if ic_mut_threshold is not None and mutual_ic > ic_mut_threshold:
+                return single_ic, None
+            mutual_ics.append(mutual_ic)
+
+        return single_ic, mutual_ics
+    
+    def _get_extra_info(self, expr: Expression) -> Any:
+        "Override this method to save extra data for a newly added expression."
+
+    def _add_factor(
+        self,
+        expr: Expression,
+        ic_ret: float,
+        ic_mut: List[float]
+    ):
+        if self._under_thres_alpha and self.size == 1:
+            self._pop()
+        n = self.size
+        self.exprs[n] = expr
+        self.single_ics[n] = ic_ret
+        for i in range(n):
+            self._mutual_ics[i][n] = self._mutual_ics[n][i] = ic_mut[i]
+        self._extra_info[n] = self._get_extra_info(expr)
+        new_weight = max(ic_ret, 0.01) if n == 0 else self.weights.mean()
+        self._weights[n] = new_weight   # Assign an initial weight
+        self.size += 1
+
+    def _pop(self, index_hint: Optional[int] = None) -> None:
+        if self.size <= self.capacity:
+            return
+        index = int(np.argmin(np.abs(self.weights))) if index_hint is None else index_hint
+        self._swap_idx(index, self.capacity)
+        self.size = self.capacity
+
+    def most_significant_indices(self, k: int) -> List[int]:
+        if self.size == 0:
+            return []
+        ranks = (-np.abs(self.weights)).argsort().argsort()
+        return [i for i in range(self.size) if ranks[i] < k]
+
+    def leave_only(self, indices: Iterable[int]) -> None:
+        "Leaves only the alphas at the given indices intact, and removes all others."
+        self._failure_cache = set()
+        indices = sorted(indices)
+        for i, j in enumerate(indices):
+            self._swap_idx(i, j)
+        self.size = len(indices)
+
+    def bulk_edit(self, removed_indices: Iterable[int], added_exprs: List[Expression]) -> None:
+        self._failure_cache = set()
+        old_ic = self.evaluate_ensemble()
+        old_pool: List[Expression] = self.exprs[:self.size] # type: ignore
+        removed_indices = set(removed_indices)
+        remain = [i for i in range(self.size) if i not in removed_indices]
+        old_exprs = {id(self.exprs[i]): i for i in range(self.size)}
+        old_update_history_count = len(self.update_history)
+        self.leave_only(remain)
+        for e in added_exprs:
+            self.try_new_expr(e)
+        self.update_history = self.update_history[:old_update_history_count]
+        new_exprs = {id(e): e for e in self.exprs[:self.size]}
+        added_exprs = [e for e in self.exprs[:self.size] if id(e) not in old_exprs] # type: ignore
+        removed_indices = list(sorted(i for eid, i in old_exprs.items() if eid not in new_exprs))
+        new_ic, new_obj = self.calculate_ic_and_objective()
+        self._maybe_update_best(new_ic, new_obj)
+        self.update_history.append(AddRemoveAlphas(
+            added_exprs=added_exprs,
+            removed_idx=removed_indices,
+            old_pool=old_pool,
+            old_pool_ic=old_ic,
+            new_pool_ic=new_ic
+        ))
+
+    def _swap_idx(self, i: int, j: int) -> None:
+        if i == j:
+            return
+        
+        def swap_in_list(lst, i: int, j: int) -> None:
+            lst[i], lst[j] = lst[j], lst[i]
+
+        swap_in_list(self.exprs, i, j)
+        swap_in_list(self.single_ics, i, j)
+        self._mutual_ics[:, [i, j]] = self._mutual_ics[:, [j, i]]
+        self._mutual_ics[[i, j], :] = self._mutual_ics[[j, i], :]
+        swap_in_list(self._weights, i, j)
+        swap_in_list(self._extra_info, i, j)
+
+
+class MseAlphaPool(LinearAlphaPool):
+    def __init__(
+        self,
+        capacity: int,
+        calculator: AlphaCalculator,
+        ic_lower_bound: Optional[float] = None,
+        l1_alpha: float = 5e-3,
+        device: torch.device = torch.device("cpu"),
+        c_override: Optional[List[float]] = None
+    ):
+        super().__init__(capacity, calculator, ic_lower_bound, device, c_override)
+        self._l1_alpha = l1_alpha
+
+    def _clone_kwargs(self) -> Dict[str, Any]:
+        kwargs = super()._clone_kwargs()
+        kwargs["l1_alpha"] = self._l1_alpha
+        return kwargs
+
+    def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:
+        alpha = self._l1_alpha
+        if math.isclose(alpha, 0.):     # No L1 regularization, use the faster least-squares method
+            return self._optimize_lstsq()
+            
+        ics_ret = torch.tensor(self.single_ics[:self.size], device=self.device)
+        ics_mut = torch.tensor(self._mutual_ics[:self.size, :self.size], device=self.device)
+        weights = torch.tensor(self.weights, device=self.device, requires_grad=True)
+        optim = torch.optim.Adam([weights], lr=lr)
+    
+        loss_ic_min = float("inf")
+        best_weights = weights
+        tolerance_count = 0
+        for step in count():
+            ret_ic_sum = (weights * ics_ret).sum()
+            mut_ic_sum = (torch.outer(weights, weights) * ics_mut).sum()
+            loss_ic = mut_ic_sum - 2 * ret_ic_sum + 1
+            loss_ic_curr = loss_ic.item()
+    
+            loss_l1 = torch.norm(weights, p=1)  # type: ignore
+            loss = loss_ic + alpha * loss_l1
+    
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+    
+            if loss_ic_min - loss_ic_curr > 1e-6:
+                tolerance_count = 0
+            else:
+                tolerance_count += 1
+    
+            if loss_ic_curr < loss_ic_min:
+                best_weights = weights
+                loss_ic_min = loss_ic_curr
+    
+            if tolerance_count >= tolerance or step >= max_steps:
+                break
+    
+        return best_weights.cpu().detach().numpy()
+    
+    def _optimize_lstsq(self) -> np.ndarray:
+        try:
+            return np.linalg.lstsq(self._mutual_ics[:self.size, :self.size],self.single_ics[:self.size])[0]
+        except (np.linalg.LinAlgError, ValueError):
+            return self.weights
+
+
+# Note: Currently the weights are only updated when the new IC is higher.
+# It might be better to update the weights according to the actual objective,
+# in this case the ICIR or the LCB of the IC.
+
+class MeanStdAlphaPool(LinearAlphaPool):
+    def __init__(
+        self,
+        capacity: int,
+        calculator: TensorAlphaCalculator,
+        ic_lower_bound: Optional[float] = None,
+        l1_alpha: float = 5e-3,
+        lcb_beta: Optional[float] = None,
+        device: torch.device = torch.device("cpu")
+    ):
+        """
+        l1_alpha: the L1 regularization coefficient.
+        lcb_beta: for optimizing the lower-confidence-bound: LCB = mean - beta * std, \
+                  when this is None, optimize ICIR (mean / std) instead.
+        """
+        super().__init__(capacity, calculator, ic_lower_bound, device)
+        self.calculator: TensorAlphaCalculator
+        self._l1_alpha = l1_alpha
+        self._lcb_beta = lcb_beta
+
+    def _clone_kwargs(self) -> Dict[str, Any]:
+        kwargs = super()._clone_kwargs()
+        kwargs.update({
+            "l1_alpha": self._l1_alpha,
+            "lcb_beta": self._lcb_beta,
+        })
+        return kwargs
+
+    def _get_extra_info(self, expr: Expression) -> Any:
+        return self.calculator.evaluate_alpha(expr)
+    
+    def _calc_main_objective(self) -> float:
+        alpha_values = torch.stack(self._extra_info[:self.size])    # type: ignore | shape: n * days * stocks
+        weights = torch.tensor(self.weights, device=self.device)
+        return self._calc_obj_impl(alpha_values, weights).item()
+    
+    def _calc_obj_impl(self, alpha_values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        target_value = self.calculator.target
+        weighted = (weights[:, None, None] * alpha_values).sum(dim=0)
+        ics = batch_pearsonr(weighted, target_value)
+        mean, std = ics.mean(), ics.std()
+        if self._lcb_beta is not None:
+            return mean - self._lcb_beta * std
+        else:
+            return mean / std
+
+    def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:
+        alpha_values = torch.stack(self._extra_info[:self.size])    # type: ignore | shape: n * days * stocks
+        weights = torch.tensor(self.weights, device=self.device, requires_grad=True)
+        optimizer = torch.optim.Adam([weights], lr=lr)
+    
+        min_loss = float("inf")
+        best_weights = weights
+        tol_count = 0
+        for step in count():
+            obj = self._calc_obj_impl(alpha_values, weights)
+            loss_l1 = torch.norm(weights, p=1)
+            loss = self._l1_alpha * loss_l1 - obj   # Maximize the objective
+            curr_loss = loss.item()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+    
+            if min_loss - curr_loss > 1e-6:
+                tol_count = 0
+            else:
+                tol_count += 1
+    
+            if curr_loss < min_loss:
+                best_weights = weights
+                min_loss = curr_loss
+    
+            if tol_count >= tolerance or step >= max_steps:
+                break
+    
+        return best_weights.cpu().detach().numpy()
