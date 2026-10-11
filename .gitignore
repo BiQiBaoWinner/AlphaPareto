@@ -1,2 +1,13 @@
 # macOS
 .DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+DocumentRevisions-V100
+
+# editor / OS artifacts of the same kind
+*.swp
+*~
