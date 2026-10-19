@@ -2,7 +2,7 @@
 
 **Formulaic Alpha Discovery with LLM-Guided Multi-Objective Reinforcement Learning**
 
-Authors: Yingbo Zhao, Zeyu Yang, Zhoufan Zhu
+Authors: Yingbo Zhao, Zeyu Yang, [Zhoufan Zhu](https://zhuzhoufan.github.io/)
 
 This repository contains the code for reproducing the experiments in the our [Neurip 2026 paper](https://arxiv.org/abs/2609.34188). We evaluate four alpha factor discovery methods on Chinese A-share markets (CSI 300, CSI 800, and All) using the [Qlib](https://github.com/microsoft/qlib) framework.
 
@@ -181,10 +181,11 @@ Please feel free to raise an issue in this GitHub repository if you have any que
 
 ## Citation
 Please cite our paper if you feel this code helps.
-
+```
 @inproceedings{zhao2026Alphapareto,
   title = {AlphaPareto: Formulaic Alpha Discovery with LLM-Guided Multi-Objective Reinforcement Learning},
   author = {Yingbo, Zhao and Zeyu, Yang and Zhu, Zhoufan},
   booktitle = {Proceedings of the 40th Conference on Neural Information Processing Systems},
   year = {2026},
 }
+```
