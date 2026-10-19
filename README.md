@@ -2,7 +2,9 @@
 
 **Formulaic Alpha Discovery with LLM-Guided Multi-Objective Reinforcement Learning**
 
-This repository contains the code for reproducing the experiments in the paper. We evaluate four alpha factor discovery methods on Chinese A-share markets (CSI 300, CSI 800, and All) using the [Qlib](https://github.com/microsoft/qlib) framework.
+Authors: Yingbo Zhao, Zeyu Yang, Zhoufan Zhu
+
+This repository contains the code for reproducing the experiments in the our [Neurip 2026 paper](https://arxiv.org/abs/2609.34188). We evaluate four alpha factor discovery methods on Chinese A-share markets (CSI 300, CSI 800, and All) using the [Qlib](https://github.com/microsoft/qlib) framework.
 
 ## Repository Structure
 
@@ -172,3 +174,17 @@ These metrics are used in `AlphaPareto`, `AlphaPareto_wo_lambda`, and `AlphaPare
 ## Acknowledgements
 
 This work builds on [Qlib](https://github.com/microsoft/qlib), [AlphaGen](https://github.com/ICT-FinD-Lab/alphagen), [AlphaForge](https://github.com/DulyHao/AlphaForge), [AlphaQCM](https://github.com/ZhuZhouFan/AlphaQCM), [AlphaAgent](https://github.com/RndmVariableQ/AlphaAgent) and [RD-Agent](https://github.com/microsoft/RD-Agent). We thank the authors and maintainers of these projects for making their code available.
+
+## Contact 
+
+Please feel free to raise an issue in this GitHub repository if you have any questions or encounter any issues.
+
+## Citation
+Please cite our paper if you feel this code helps.
+
+@inproceedings{zhao2026Alphapareto,
+  title = {AlphaPareto: Formulaic Alpha Discovery with LLM-Guided Multi-Objective Reinforcement Learning},
+  author = {Yingbo, Zhao and Zeyu, Yang and Zhu, Zhoufan},
+  booktitle = {Proceedings of the 40th Conference on Neural Information Processing Systems},
+  year = {2026},
+}
